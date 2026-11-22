@@ -829,13 +829,17 @@ impl Reason {
         r.text = r.text.replacen("%s", arg, 1);
         r
     }
-    /// The session service's text inside vanilla's login failure message.
-    /// Auto-reconnect uses the specific reason's key, or the wrapper key
-    /// for a refusal whose reason was plain text.
+    /// Wraps the session service's reason in vanilla's login failure message.
+    /// Auto-reconnect uses the reason key, treating rate limits like temporary
+    /// outages and other plain-text refusals as permanent.
     fn login_failure(error: crate::auth::JoinError, lang: &Language) -> Self {
         let wrapper = "disconnect.loginFailedInfo";
         let (reason, key) = match error.reason() {
             Ok(key) => (tr(lang, key), key),
+            Err(message) if matches!(error, crate::auth::JoinError::RateLimited(_)) => (
+                message.to_owned(),
+                "disconnect.loginFailedInfo.serversUnavailable",
+            ),
             Err(message) => (message.to_owned(), wrapper),
         };
         Self {
@@ -1907,21 +1911,32 @@ mod tests {
     use horizon_world::native_load_context::DataLoadOrigin;
 
     #[test]
-    fn session_join_rate_limit_disconnects_without_auto_reconnect() {
+    fn session_join_retries_only_temporary_failures() {
         let lang: Language = [(
             "disconnect.loginFailedInfo".to_owned(),
             "Failed to log in: %s".to_owned(),
         )]
         .into_iter()
         .collect();
-        let error = crate::auth::JoinError::from_response(429, "");
-        let reason = Reason::login_failure(error, &lang);
-        assert_eq!(reason.text, "Failed to log in: Status: 429");
-        assert!(!crate::reconnect::allowed(
-            &reason.text,
-            reason.key.as_deref(),
-            false,
-        ));
+        for (status, body, message, retry) in [
+            (429, "", "Status: 429", true),
+            (403, "", "Status: 403", false),
+            (
+                403,
+                r#"{"errorMessage":"Request refused"}"#,
+                "Request refused",
+                false,
+            ),
+        ] {
+            let error = crate::auth::JoinError::from_response(status, body);
+            let reason = Reason::login_failure(error, &lang);
+            assert_eq!(reason.text, format!("Failed to log in: {message}"));
+            assert_eq!(
+                crate::reconnect::allowed(&reason.text, reason.key.as_deref(), false),
+                retry,
+                "{status} {body}",
+            );
+        }
         let unavailable = Reason::login_failure(crate::auth::JoinError::Unavailable, &lang);
         assert!(crate::reconnect::allowed(
             &unavailable.text,
