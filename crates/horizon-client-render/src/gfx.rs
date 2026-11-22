@@ -1855,7 +1855,10 @@ pub struct Renderer {
     lod_retiring: crate::fast_hash::FxHashSet<SectionKey>,
     /// Removed sections fading out over far terrain (`leave_section`).
     lod_leaving: Vec<(SectionKey, std::time::Instant)>,
-    lod_uploads: lod::Uploads,
+    /// Finished tile meshes `upload_lods` has yet to upload.
+    lod_pending: Option<lod::Pending>,
+    /// Completed empty tiles can satisfy another mesh's finer cutout.
+    lod_empty: crate::fast_hash::FxHashSet<crate::lod::TileKey>,
     detail_columns: FxHashMap<(i32, i32), SectionMask>,
     /// Bumped whenever a column becomes or stops being complete.
     detail_revision: u64,
@@ -4812,7 +4815,8 @@ impl Renderer {
             lod_cutout: Default::default(),
             lod_retiring: Default::default(),
             lod_leaving: Vec::new(),
-            lod_uploads: lod::Uploads::default(),
+            lod_pending: None,
+            lod_empty: Default::default(),
             detail_columns: Default::default(),
             detail_revision: 0,
             upload_retries: UploadRetries::default(),
@@ -6194,7 +6198,8 @@ impl Renderer {
         self.lod_cutout.clear();
         self.lod_retiring.clear();
         self.lod_leaving.clear();
-        self.lod_uploads = lod::Uploads::default();
+        self.lod_pending = None;
+        self.lod_empty.clear();
         self.detail_columns.clear();
         self.detail_revision += 1;
         self.upload_retries.clear();
@@ -6245,7 +6250,7 @@ impl Renderer {
             return;
         }
         self.sections_dropped |=
-            self.sections.len() > 0 || !self.lods.is_empty() || self.lod_uploads.pending.is_some();
+            self.sections.len() > 0 || !self.lods.is_empty() || self.lod_pending.is_some();
         self.clear_sections(self.layout);
         (self.sorted_indices, self.translucent_arena) = arena::Arena::translucent_arenas(
             &self.device,
@@ -6896,9 +6901,8 @@ impl Renderer {
             holds &= arena.set_looks(&self.device, on);
         }
         if !holds || on {
-            self.sections_dropped |= self.sections.len() > 0
-                || !self.lods.is_empty()
-                || self.lod_uploads.pending.is_some();
+            self.sections_dropped |=
+                self.sections.len() > 0 || !self.lods.is_empty() || self.lod_pending.is_some();
             self.clear_sections(self.layout);
             // Flat draws size a translucent page's table by it when they make the table: it
             // changes with `clear_sections`, which drops the tables.

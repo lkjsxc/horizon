@@ -13,14 +13,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Upload state moves with the meshes when a new renderer takes over the world.
-#[derive(Default)]
-pub(super) struct Uploads {
-    pub pending: Option<Pending>,
-    /// Completed empty tiles can satisfy another mesh's finer cutout.
-    empty: FxHashSet<TileKey>,
-}
-
 /// Finished tile meshes not uploaded yet, the tiles they replace and the
 /// columns they leave out.
 #[derive(Default)]
@@ -662,7 +654,7 @@ impl Renderer {
                 copies.forget_tile(key);
             }
         }
-        self.lod_uploads.empty.remove(&key);
+        self.lod_empty.remove(&key);
         let old = self.lods.remove(&key);
         let old_slot = old.as_ref().map(|tile| tile.cull_slot);
         let Handoff {
@@ -731,7 +723,7 @@ impl Renderer {
     }
 
     pub fn remove_lod(&mut self, key: TileKey) {
-        self.lod_uploads.empty.remove(&key);
+        self.lod_empty.remove(&key);
         if let Some(copies) = &mut self.capture_copies {
             copies.forget_tile(key);
         }
@@ -745,7 +737,8 @@ impl Renderer {
         if let Some(copies) = &mut self.capture_copies {
             copies.clear_tiles();
         }
-        self.lod_uploads = Uploads::default();
+        self.lod_pending = None;
+        self.lod_empty.clear();
         for (_, tile) in std::mem::take(&mut self.lods) {
             self.release_tile(tile);
         }
@@ -780,8 +773,7 @@ impl Renderer {
         if meshes.is_empty() && removed.is_empty() && cutout.is_none() {
             return;
         }
-        self.lod_uploads
-            .pending
+        self.lod_pending
             .get_or_insert_default()
             .add(meshes, removed, cutout);
     }
@@ -791,8 +783,7 @@ impl Renderer {
     pub fn upload_lods(&mut self, budget: Duration) {
         let start = Instant::now();
         if self
-            .lod_uploads
-            .pending
+            .lod_pending
             .as_ref()
             .is_some_and(|p| p.needs_finish && p.retry_at.is_empty())
         {
@@ -825,8 +816,7 @@ impl Renderer {
         // old mesh until they are in, so no hole shows through them.
         let mut around_new = FxHashSet::default();
         let new = self
-            .lod_uploads
-            .pending
+            .lod_pending
             .iter()
             .flat_map(|pending| pending.meshes.keys())
             .filter(|key| !self.lods.contains_key(key))
@@ -843,14 +833,13 @@ impl Renderer {
             }
         }
         let taken: Vec<_> = self
-            .lod_uploads
-            .pending
+            .lod_pending
             .iter()
             .flat_map(|pending| pending.cutout.iter().flatten())
             .filter(|column| !self.lod_cutout.contains(column))
             .copied()
             .collect();
-        while let Some(pending) = &mut self.lod_uploads.pending {
+        while let Some(pending) = &mut self.lod_pending {
             // Keys meshed again keep their place; removed ones are skipped.
             let Some((key, mesh)) = pending.take_next(start) else {
                 break;
@@ -863,7 +852,7 @@ impl Renderer {
                     (x..x + size).contains(&(cx * 16)) && (z..z + size).contains(&(cz * 16))
                 });
             let uploaded = self.upload_lod(key, &mesh, keep);
-            let pending = self.lod_uploads.pending.as_mut().expect("pending tiles");
+            let pending = self.lod_pending.as_mut().expect("pending tiles");
             if uploaded {
                 pending.needs_finish = true;
             } else {
@@ -879,12 +868,11 @@ impl Renderer {
             }
         }
         if self
-            .lod_uploads
-            .pending
+            .lod_pending
             .as_ref()
             .is_some_and(|pending| pending.needs_finish)
         {
-            let pending = self.lod_uploads.pending.take().expect("pending tiles");
+            let pending = self.lod_pending.take().expect("pending tiles");
             self.finish_lod_uploads(pending, start);
         }
     }
@@ -914,7 +902,7 @@ impl Renderer {
         let whole = now.checked_sub(FADE).unwrap_or(now);
         let released = finish_uploads(
             &mut self.lods,
-            &mut self.lod_uploads.empty,
+            &mut self.lod_empty,
             &mut self.lod_cull_free,
             &pending.removed,
             &unfinished,
@@ -944,7 +932,7 @@ impl Renderer {
             if overlaps_withheld(key) || unpublished_shadows.overlaps(key) {
                 return true;
             }
-            self.lod_uploads.empty.remove(&key);
+            self.lod_empty.remove(&key);
             if let Some(tile) = self.lods.get_mut(&key)
                 && tile.dying.is_none()
             {
@@ -982,7 +970,7 @@ impl Renderer {
         }
         if !pending.meshes.is_empty() || !pending.removed.is_empty() {
             pending.needs_finish = false;
-            self.lod_uploads.pending = Some(pending);
+            self.lod_pending = Some(pending);
         }
     }
 
@@ -1555,11 +1543,11 @@ mod tests {
         retiring.leaving = Some(now);
         let later = now + FADE;
         let removed = FxHashSet::default();
-        let mut uploads = Uploads::default();
+        let mut empty = FxHashSet::default();
         assert!(
             finish_uploads(
                 &mut tiles,
-                &mut uploads.empty,
+                &mut empty,
                 &mut Vec::new(),
                 &removed,
                 &TileCoverage::default(),
@@ -1581,14 +1569,14 @@ mod tests {
             "the level-zero replacement already owns this column"
         );
 
-        // An empty child satisfies the cutout, including after the renderer moves its
-        // upload state as one value in `take_world`.
-        uploads.empty.insert(missing);
-        let mut rebuilt = Uploads::default();
-        std::mem::swap(&mut uploads, &mut rebuilt);
+        // An empty child satisfies the cutout, including after `take_world`
+        // moves the completed empty tiles to the new renderer.
+        empty.insert(missing);
+        let mut rebuilt_empty = FxHashSet::default();
+        std::mem::swap(&mut empty, &mut rebuilt_empty);
         finish_uploads(
             &mut tiles,
-            &mut rebuilt.empty,
+            &mut rebuilt_empty,
             &mut Vec::new(),
             &removed,
             &TileCoverage::default(),
